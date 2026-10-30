@@ -217,7 +217,7 @@ Airflow에서 보통 `ExternalTaskSensor`로 센싱하는데, 아래와 같은 �
 |---|---|
 | 계약 표면 | FastAPI · HTTP |
 | 선언 원장 | MySQL (`dataset_readiness`) |
-| 판정 | dataset 별 판정기 (예: sidestream 은 적재 run 완료 기반) |
+| 판정 | dataset 별 판정기 (예: 스트리밍 데이터셋은 적재 run 완료 기반) |
 
 #### 1. 왜 필요한가
 
@@ -259,7 +259,7 @@ Airflow에서 보통 `ExternalTaskSensor`로 센싱하는데, 아래와 같은 �
 - 입력 오류는 `false` 가 아니라 **4xx** — "영구히 거짓" 과 "아직 아님" 을 구분하기 위함
 
 ```http
-GET /readiness?dataset=log__sidestream__streaming&start=2026-10-01 00:30&end=2026-10-02 00:30
+GET /readiness?dataset=my_dataset&start=2026-10-01 00:30&end=2026-10-02 00:30
 
 200 {"ready": true,  "interpreted": {...}}
 200 {"ready": false, "interpreted": {...},
@@ -275,9 +275,9 @@ GET /readiness?dataset=log__sidestream__streaming&start=2026-10-01 00:30&end=202
 ```python
 from utils.readiness import DataReadySensor
 
-wait_log_sidestream = DataReadySensor(
-    task_id="wait_log_sidestream",
-    dataset="log__sidestream__streaming",
+wait_my_dataset = DataReadySensor(
+    task_id="wait_my_dataset",
+    dataset="my_dataset",
     # SQL 이 실제로 읽는 구간 — SQL 의 WHERE 에 쓰는 문자열 그대로
     start="{{ macros.ds_add(params.target_date, -14) }}",
     end="{{ params.target_date }}",
