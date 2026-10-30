@@ -110,9 +110,9 @@
     - 이거보고 뭐 이것저것 만들었는데, 문제는 최신화를 어떻게 잘 하지? 고민이 됨
     - 찾아보니 Hook이라는 개념이 존재.
 
-![wiki hook 1](images/wiki-hook-1.png)
+<img src="images/wiki-hook-1.png" alt="wiki hook 1" width="600">
 
-![wiki hook 2](images/wiki-hook-2.png)
+<img src="images/wiki-hook-2.png" alt="wiki hook 2" width="450">
 
 <details>
 <summary>hook 예시 (<code>./main/.claude/hooks/wiki-ingest-reminder.js</code>)</summary>
@@ -208,12 +208,106 @@ Airflow에서 보통 `ExternalTaskSensor`로 센싱하는데, 아래와 같은 �
 - 처음에는 Asset(Dataset)으로 구현해보려고 함.
   - 근데 Asset은 시간에 대해서 point를 가지고 있지, 범위로 가지고 있지않음
 - 그래서 api 만듦
-- 아키텍처
-  - [link](http://dataobs.gnst.me/dataplatform-docs/architecture/dataset-readiness-architecture/) (링크말고 내용으로 대체해야함)
-- 후기
-  - 이제 막 배포해서 쌓아가는 단계
-  - 꽤 괜찮은 접근같은데, 왜 Airflow 포함해서 아직 없는거같지? (일단 나는 처음 들음)
-  - 좀 더 써보고 후기 공유해드림
+
+### 아키텍처: Dataset Readiness 계약
+
+> 배치 DAG 의 **"run 이 돌았다"** 를 **"이 구간 데이터 써도 된다"** 로 바꾸는 구조
+
+| 항목 | 값 |
+|---|---|
+| 계약 표면 | FastAPI · HTTP |
+| 선언 원장 | MySQL (`dataset_readiness`) |
+| 판정 | dataset 별 판정기 (예: sidestream 은 적재 run 완료 기반) |
+
+#### 1. 왜 필요한가
+
+- 소비자 DAG 가 `DagRunsReadySensor(expected_run_count=24)` 처럼 **생산자의 run 개수로 완결을 추측**하고 있었음
+- run 개수는 event-time 창이 다 찼는지에 대해 아무것도 말해주지 않음
+  - 23시 이벤트가 다음날 00:30 run 에 들어옴
+  - `*/5` DAG 의 `data_interval` 은 event-time 창이 아님
+  - run 하나가 의도적으로 실패(FAILFAST)하고 다음 사이클에 자가복구돼도, run-count 판정만 그날 영구히 깨짐
+
+#### 2. 시스템 컨텍스트 — 판정기는 원천마다, 계약은 하나
+
+<img src="images/readiness-1-context.png" alt="시스템 컨텍스트" width="720">
+
+- 완결을 판단하는 기준은 원천마다 다름 — 스트리밍은 이벤트 시각, CDC 는 복제 지연, 데이터마트는 상류 적재 완료
+- 그 차이는 판정기가 흡수해서 같은 스키마로 선언하고, 소비자는 계약만 앎 (grain·타임존·파티션 몰라도 됨)
+- HTTP 로 만든 이유: Airflow 가 아닌 소비자(dbt, OpenMetadata, 타 서비스)도 같은 엔드포인트를 씀
+
+#### 3. 무엇이 사라지는가
+
+<img src="images/readiness-2-before-after.png" alt="현재와 전환 후 비교" width="720">
+
+- 핵심은 **소비자가 생산자의 Airflow 메타데이터를 보지 않게 되는 것**
+- 위쪽 붉은 점선(센서가 생산자 DagRun 을 직접 세던 경로)이 사라짐 → 생산자가 스케줄·DAG 구조·실패 의미를 바꿔도 소비자가 안 깨짐
+
+#### 4. 컨테이너
+
+<img src="images/readiness-3-container.png" alt="컨테이너" width="720">
+
+- 판정 DAG: DAG = grain, task = target. 창 하나가 완결되면 API 에 선언
+- Readiness API: 선언을 합쳐 **완결 구간**을 유지하고 질의에 답함 — 이 계산이 소비자 코드에 복제되지 않음
+- 판정기도 MySQL 에 직접 쓰지 않고 API 를 거침 → 잘못된 선언(미등록 dataset, grain 에 안 맞는 창, 아직 안 닫힌 창 등)을 한 곳에서 4xx 로 거름
+
+#### 5. 질의 하나가 지나는 경로
+
+<img src="images/readiness-4-query-path.png" alt="질의 경로" width="720">
+
+- 소비자는 **SQL 이 읽는 구간을 SQL 에 쓰는 문자열 그대로** 넘김 → 확인하는 구간과 읽는 구간이 정의상 같음
+- 완결 구간끼리는 겹치지도 맞닿지도 않음 → `start` 앞에서 시작하는 구간 하나만 PK 로 찾으면 끝 (grain 과 무관하게 읽는 행 수가 적음)
+- 입력 오류는 `false` 가 아니라 **4xx** — "영구히 거짓" 과 "아직 아님" 을 구분하기 위함
+
+```http
+GET /readiness?dataset=log__sidestream__streaming&start=2026-10-01 00:30&end=2026-10-02 00:30
+
+200 {"ready": true,  "interpreted": {...}}
+200 {"ready": false, "interpreted": {...},
+     "missing": [{"start": "2026-10-02T00:00:00", "end": "2026-10-02T00:30:00"}]}
+404 {"error": "unknown_dataset"}
+422 {"error": "invalid_timezone", "tz": "KST"}
+```
+
+- `false` 일 때 `missing` 으로 **어느 구간이 비었는지**까지 돌려줌 → 폴링 로그에서 무엇을 기다리는지 바로 보임
+
+소비자 코드는 이 정도:
+
+```python
+from utils.readiness import DataReadySensor
+
+wait_log_sidestream = DataReadySensor(
+    task_id="wait_log_sidestream",
+    dataset="log__sidestream__streaming",
+    # SQL 이 실제로 읽는 구간 — SQL 의 WHERE 에 쓰는 문자열 그대로
+    start="{{ macros.ds_add(params.target_date, -14) }}",
+    end="{{ params.target_date }}",
+)
+```
+
+#### 6. 원장과 완결 구간
+
+<img src="images/readiness-5-ready-span.png" alt="완결 구간" width="720">
+
+- 원장(`dataset_readiness`)에는 창 단위 선언을 쌓고, 질의는 그걸 합친 **완결 구간**(`dataset_ready_span`)만 봄
+- daily 와 hourly 가 섞여 있어도 같은 구간으로 합쳐져서 서로 보완함
+- 무효화는 grain 무관하게 시간 범위로 함 — 6/1 10시만 무효화해도 그 시간을 덮던 daily 까지 빠지고, 완결 구간이 10시 앞뒤로 쪼개짐
+- 무효화 이전 데이터를 보고 내린 판정은 **epoch** 로 막음
+  - 무효화마다 dataset epoch +1
+  - 판정기는 데이터를 보기 전에 epoch 를 읽고 선언에 실어 보냄
+  - 다르면 `409 stale_declaration` → 다음 run 에 다시 판정
+- 저장소가 Snowflake 가 아니라 MySQL 인 이유: 300초 폴링마다 warehouse 를 깨워서 최소 과금을 낼 이유가 불리언 한 줄 조회에는 없음
+
+#### 7. 대가
+
+- API 가 죽으면 모든 소비자가 대기함 (`ready: true` 도 무효화될 수 있어서 캐시 안 함)
+- 운영할 서비스가 하나 늘어남 — 대신 판정 로직이 한 곳에만 있고, Airflow 밖 소비자도 쓸 수 있음
+- readiness 는 **완결성**만 다룸. 중복 제거 같은 **정확성**은 별도 장치 필요
+
+### 후기
+
+- 이제 막 배포해서 쌓아가는 단계
+- 꽤 괜찮은 접근같은데, 왜 Airflow 포함해서 아직 없는거같지? (일단 나는 처음 들음)
+- 좀 더 써보고 후기 공유해드림
 
 ---
 
